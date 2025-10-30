@@ -2,3 +2,35 @@
 *.db
 __pycache__/
 .venv/
+# Private keys
+keys/
+*.pem
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Environment
+.env
+.venv/
+
+# Cache
+__pycache__/
+*.pyc
+# Private keys
+keys/
+*.pem
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Environment
+.env
+.venv/
+
+# Cache
+__pycache__/
+*.pyc

@@ -219,8 +219,7 @@ async def btn_off(m: Message):
 async def btn_top(m: Message):
     _, _, _, tz = await get_user_prefs(m.from_user.id)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT ticker, side, notional_usd, ts_ms FROM prints WHERE ts_ms >= ? ORDER BY notional_usd DESC LIMIT 10",
-    (now_ms() - 24 * 3600 * 1000,))
+        cur = await db.execute("SELECT ticker, side, notional_usd, ts_ms FROM prints ORDER BY id DESC LIMIT 10")
         rows = await cur.fetchall()
         await cur.close()
     if not rows:
