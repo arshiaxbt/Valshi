@@ -383,7 +383,7 @@ async def leaderboard_callback(callback: CallbackQuery):
         for i, trader in enumerate(rank_list, 1):
             nickname = trader.get("nickname", "Unknown")
             value = trader.get("value", 0)
-            rank = trader.get("rank", "?")
+            rank = i  
     
             if metric == "volume":
                 value_str = f"${value/1_000_000:.1f}M"
