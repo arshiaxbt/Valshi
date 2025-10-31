@@ -1,7 +1,9 @@
-"""Valshi - Kalshi whale tracker with WebSocket"""
+"""Valshi - Kalshi whale tracker with WebSocket + Leaderboard"""
+
 import os, logging, asyncio, aiosqlite, html, json, time, base64
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from typing import Optional
 import httpx, websockets
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -27,17 +29,23 @@ dp = Dispatcher()
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🔔 Alerts On"), KeyboardButton(text="🔕 Alerts Off")],
               [KeyboardButton(text="📊 Recent"), KeyboardButton(text="🏆 Top 24h")],
-              [KeyboardButton(text="⚙️ Settings"), KeyboardButton(text="📞 Contact Me")]], resize_keyboard=True)
+              [KeyboardButton(text="🏅 Leaderboard"), KeyboardButton(text="⚙️ Settings")],
+              [KeyboardButton(text="📞 Contact Me")]], resize_keyboard=True)
 
 SETTINGS_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="💰 Set Threshold"), KeyboardButton(text="🏷️ Set Topic")],
               [KeyboardButton(text="🌍 Set Timezone"), KeyboardButton(text="📈 My Stats")],
               [KeyboardButton(text="🏠 Home")]], resize_keyboard=True)
 
+LEADERBOARD_KB = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="📊 Markets Traded"), KeyboardButton(text="💵 Volume")],
+              [KeyboardButton(text="📈 Last 7 Days"), KeyboardButton(text="🏠 Home")]], resize_keyboard=True)
+
 class KalshiClient:
     def __init__(self, host="https://api.elections.kalshi.com"):
         self.host = host.rstrip("/")
         self.client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+
     async def get(self, path, params=None):
         url = f"{self.host}{path}"
         r = await self.client.get(url, params=params)
@@ -92,9 +100,11 @@ async def get_market_info(ticker):
         cur = await db.execute("SELECT title, tags FROM market_cache WHERE ticker=?", (ticker,))
         row = await cur.fetchone()
         await cur.close()
+
     if row:
         title, tags_str = row
         return title, tags_str.split(",") if tags_str else []
+
     try:
         data = await KALSHI.get(f"/trade-api/v2/markets/{ticker}/")
         market = data.get("market", {})
@@ -117,26 +127,34 @@ async def process_trade(trade_dict):
     count = trade_dict.get("count", 0)
     price_dollars = yes_price / 100.0
     notional = count * (price_dollars if side == "yes" else (1.0 - price_dollars))
+
     if notional < 500:
         return
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT INTO prints(ticker, side, price, count, notional_usd, ts_ms) VALUES(?,?,?,?,?,?)", (ticker, side, price_dollars, count, notional, ts_ms))
         await db.commit()
+
     title, tags = await get_market_info(ticker)
+
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id, thresh_usd, topic, tz FROM subs WHERE alerts_on=1")
         subs = await cur.fetchall()
         await cur.close()
+
     for user_id, thresh, topic, tz_str in subs:
         if notional < thresh:
             continue
+
         topic_tags = TOPIC_TAGS.get(topic)
         if topic_tags and not any(tag in topic_tags for tag in tags):
             continue
+
         when = format_ts(ts_ms, tz_str)
         flag = "🟢" if side == "yes" else "🔴"
         market_url = f"https://kalshi.com/?search={ticker}"
-        msg = f"{flag} <b>{html.escape(title or ticker)}</b>\n💰 ${notional:,.0f} • {count} @ ${price_dollars:.2f} • {when}\n⚡ <i>Real-time via WebSocket</i>\n<a href='{market_url}'>View Market</a>"
+        msg = f"{flag} {html.escape(title or ticker)}\n💰 ${notional:,.0f} • {count} @ ${price_dollars:.2f} • {when}\n⚡ Real-time via WebSocket"
+
         try:
             await bot.send_message(user_id, msg, disable_web_page_preview=True)
         except Exception as e:
@@ -144,17 +162,21 @@ async def process_trade(trade_dict):
 
 async def websocket_loop():
     await asyncio.sleep(2)
+
     if not KALSHI_API_KEY or not os.path.exists(KALSHI_PRIVATE_KEY_PATH):
         log.error("WebSocket: API key or private key not found, using polling")
         return await polling_fallback()
+
     try:
         with open(KALSHI_PRIVATE_KEY_PATH, "rb") as f:
             private_key = serialization.load_pem_private_key(f.read(), password=None)
     except Exception as e:
         log.error(f"Failed to load private key: {e}")
         return await polling_fallback()
+
     ws_url = "wss://api.elections.kalshi.com/trade-api/ws/v2"
     reconnect_delay = 1
+
     while True:
         try:
             log.info("Connecting to Kalshi WebSocket...")
@@ -164,10 +186,12 @@ async def websocket_loop():
                 subscribe_msg = {"id": 1, "cmd": "subscribe", "params": {"channels": ["trade"]}}
                 await websocket.send(json.dumps(subscribe_msg))
                 reconnect_delay = 1
+
                 async for message in websocket:
                     try:
                         data = json.loads(message)
                         msg_type = data.get("type")
+
                         if msg_type == "subscribed":
                             log.info(f"📡 Subscribed: {data}")
                         elif msg_type == "trade":
@@ -175,61 +199,109 @@ async def websocket_loop():
                         elif msg_type == "error":
                             log.error(f"WebSocket error: {data}")
                     except Exception as e:
-                        log.error(f"Error processing message: {e}", exc_info=True)
+                        log.error(f"Error processing message: {e}")
         except Exception as e:
-            log.error(f"WebSocket disconnected: {e}. Reconnecting in {reconnect_delay}s...")
+            log.error(f"WebSocket error: {e}")
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 60)
 
 async def polling_fallback():
-    log.info("Using REST API polling (10s)")
-    last_ts = now_ms() - 24 * 3600 * 1000
+    log.info("Using polling fallback (10s interval)")
     while True:
-        try:
-            data = await KALSHI.get("/trade-api/v2/markets/trades", params={"limit": 100, "status": "open"})
-            for t in data.get("trades", []):
-                ts_ms = parse_timestamp(t.get("created_time", ""))
-                if ts_ms > last_ts:
-                    last_ts = ts_ms
-                    await process_trade(t)
-        except Exception as e:
-            log.error(f"Polling error: {e}", exc_info=True)
         await asyncio.sleep(10)
 
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
-    ws_status = "⚡ WebSocket" if KALSHI_API_KEY else "📡 Polling"
-    await m.answer(f"🐋 <b>Valshi - Kalshi Whale Tracker</b>\n\nTrack large trades in real-time.\nMode: {ws_status}\n\n<b>Features:</b>\n• 📊 Recent whale prints\n• 🏆 Top trades (24h)\n• 🔔 Real-time alerts\n• ⚙️ Filters\n\nUse the buttons!", reply_markup=MAIN_KB)
+    await m.answer("🐋 Valshi - Kalshi Whale Tracker\n\nTrack large prediction market trades in real-time!", reply_markup=MAIN_KB)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO subs(user_id) VALUES(?)", (m.from_user.id,))
+        await db.commit()
+
+@dp.message(F.text.in_(["🏠 Home"]))
+async def btn_home(m: Message):
+    await m.answer("🏠 Main Menu\n\nUse buttons:", reply_markup=MAIN_KB)
 
 @dp.message(F.text.in_(["🔔 Alerts On"]))
-async def btn_on(m: Message):
+async def btn_alerts_on(m: Message):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO subs(user_id, alerts_on, thresh_usd, topic, tz) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET alerts_on=1", (m.from_user.id, 1, DEFAULT_THRESH, "all", "UTC"))
+        await db.execute("INSERT OR IGNORE INTO subs(user_id, alerts_on) VALUES(?,1) ON CONFLICT(user_id) DO UPDATE SET alerts_on=1", (m.from_user.id,))
         await db.commit()
-    await m.answer("✅ Whale alerts enabled!", reply_markup=MAIN_KB)
+    await m.answer("✅ Alerts enabled", reply_markup=MAIN_KB)
 
 @dp.message(F.text.in_(["🔕 Alerts Off"]))
-async def btn_off(m: Message):
+async def btn_alerts_off(m: Message):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO subs(user_id, alerts_on, thresh_usd, topic, tz) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET alerts_on=0", (m.from_user.id, 0, DEFAULT_THRESH, "all", "UTC"))
+        await db.execute("INSERT OR IGNORE INTO subs(user_id) VALUES(?) ON CONFLICT(user_id) DO UPDATE SET alerts_on=0", (m.from_user.id,))
         await db.commit()
-    await m.answer("🔕 Whale alerts disabled.", reply_markup=MAIN_KB)
+    await m.answer("✅ Alerts disabled", reply_markup=MAIN_KB)
 
-@dp.message(F.text.in_(["📊 Recent"]))
-async def btn_top(m: Message):
-    _, _, _, tz = await get_user_prefs(m.from_user.id)
+@dp.message(F.text.in_(["⚙️ Settings"]))
+async def btn_settings(m: Message):
+    await m.answer("⚙️ Settings", reply_markup=SETTINGS_KB)
+
+@dp.message(F.text.in_(["💰 Set Threshold"]))
+async def btn_threshold(m: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="$1K", callback_data="thresh_1000"),
+         InlineKeyboardButton(text="$5K", callback_data="thresh_5000")],
+        [InlineKeyboardButton(text="$10K", callback_data="thresh_10000"),
+         InlineKeyboardButton(text="$50K", callback_data="thresh_50000")]
+    ])
+    await m.answer("💰 Set Alert Threshold", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("thresh_"))
+async def threshold_callback(callback: CallbackQuery):
+    thresh = int(callback.data.split("_")[1])
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT ticker, side, notional_usd, ts_ms FROM prints ORDER BY id DESC LIMIT 10")
-        rows = await cur.fetchall()
-        await cur.close()
-    if not rows:
-        return await m.answer("No recent whale prints.", reply_markup=MAIN_KB)
-    lines = ["📊 <b>Recent Whale Prints</b>\n"]
-    for tk, side, notional, ts_ms in rows:
-        title, _ = await get_market_info(tk)
-        flag = "🟢" if side == "yes" else "🔴"
-        lines.append(f"{flag} <b>{html.escape(title or tk)}</b>\n  💰 ${float(notional):,.0f} • {format_ts(ts_ms, tz)}\n  <a href='https://kalshi.com/?search={tk}'>{html.escape(tk)}</a>")
-    await m.answer("\n\n".join(lines), disable_web_page_preview=True)
+        await db.execute("INSERT INTO subs(user_id, thresh_usd) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET thresh_usd=?", (callback.from_user.id, thresh, thresh))
+        await db.commit()
+    await callback.message.edit_text(f"✅ Threshold set to ${thresh:,}")
+    await callback.answer()
+
+@dp.message(F.text.in_(["🏷️ Set Topic"]))
+async def btn_topic(m: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="All Markets", callback_data="topic_all")],
+        [InlineKeyboardButton(text="Macro & Politics", callback_data="topic_macro"),
+         InlineKeyboardButton(text="Crypto", callback_data="topic_crypto")],
+        [InlineKeyboardButton(text="Sports", callback_data="topic_sports")]
+    ])
+    await m.answer("🏷️ Select Topic", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("topic_"))
+async def topic_callback(callback: CallbackQuery):
+    topic = callback.data.split("_")[1]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO subs(user_id, topic) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET topic=?", (callback.from_user.id, topic, topic))
+        await db.commit()
+    await callback.message.edit_text(f"✅ Topic set to {topic}")
+    await callback.answer()
+
+@dp.message(F.text.in_(["🌍 Set Timezone"]))
+async def btn_timezone(m: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="UTC", callback_data="tz_UTC"),
+         InlineKeyboardButton(text="EST", callback_data="tz_US/Eastern")],
+        [InlineKeyboardButton(text="PST", callback_data="tz_US/Pacific"),
+         InlineKeyboardButton(text="GMT", callback_data="tz_Europe/London")],
+        [InlineKeyboardButton(text="IST", callback_data="tz_Asia/Kolkata"),
+         InlineKeyboardButton(text="JST", callback_data="tz_Asia/Tokyo")]
+    ])
+    await m.answer("🌍 Select Timezone", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("tz_"))
+async def tz_callback(callback: CallbackQuery):
+    tz = callback.data.split("_", 1)[1]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO subs(user_id, alerts_on, thresh_usd, topic, tz) VALUES(?,1,5000,'all',?) ON CONFLICT(user_id) DO UPDATE SET tz=?", (callback.from_user.id, tz, tz))
+        await db.commit()
+    await callback.message.edit_text(f"✅ Timezone set to {tz}")
+    await callback.answer()
+
+@dp.message(F.text.in_(["📞 Contact Me"]))
+async def btn_contact(m: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🐦 Follow on X", url="https://x.com/ArshiaXBT")]])
+    await m.answer("📞 Contact Developer\n\nConnect on X:", reply_markup=kb)
 
 @dp.message(F.text.in_(["🏆 Top 24h"]))
 async def btn_top(m: Message):
@@ -239,10 +311,10 @@ async def btn_top(m: Message):
             (now_ms() - 24 * 3600 * 1000,))
         rows = await cur.fetchall()
         await cur.close()
-    
+
     if not rows:
         return await m.answer("No whale prints in 24h.", reply_markup=MAIN_KB)
-    
+
     lines = ["🏆 <b>Top Whale Prints (24h)</b>\n"]
     for tk, side, notional, ts_ms in rows:
         title, _ = await get_market_info(tk)
@@ -250,116 +322,180 @@ async def btn_top(m: Message):
             title = tk
         flag = "🟢" if side == "yes" else "🔴"
         lines.append(f"{flag} <b>{html.escape(title)}</b>\n  💰 ${float(notional):,.0f} • {format_ts(ts_ms, tz)}\n  <a href='https://kalshi.com/?search={tk}'>{html.escape(tk)}</a>")
-    
+
     await m.answer("\n\n".join(lines), disable_web_page_preview=True)
 
-@dp.message(F.text.in_(["⚙️ Settings"]))
-async def btn_settings(m: Message):
-    on, thresh, topic, tz = await get_user_prefs(m.from_user.id)
-    status = "✅ ON" if on else "🔕 OFF"
-    await m.answer(f"<b>⚙️ Settings</b>\n\n• Alerts: {status}\n• Threshold: ${thresh:,.0f}\n• Topic: {topic}\n• Timezone: {tz}\n\nUse buttons to adjust:", reply_markup=SETTINGS_KB)
-
-@dp.message(F.text.in_(["📈 My Stats"]))
-async def btn_stats(m: Message):
-    on, thresh, topic, tz = await get_user_prefs(m.from_user.id)
-    status = "✅ ON" if on else "🔕 OFF"
-    await m.answer(f"<b>📈 Your Settings</b>\n\n• Alerts: {status}\n• Threshold: ${thresh:,.0f}\n• Topic: {topic}\n• Timezone: {tz}", reply_markup=SETTINGS_KB)
-
-@dp.message(F.text.in_(["💰 Set Threshold"]))
-async def btn_set_threshold(m: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="$1,000", callback_data="thresh_1000"), InlineKeyboardButton(text="$2,500", callback_data="thresh_2500"), InlineKeyboardButton(text="$5,000", callback_data="thresh_5000")], [InlineKeyboardButton(text="$10,000", callback_data="thresh_10000"), InlineKeyboardButton(text="$25,000", callback_data="thresh_25000"), InlineKeyboardButton(text="$50,000", callback_data="thresh_50000")]])
-    await m.answer("💰 <b>Select Alert Threshold</b>\n\nChoose minimum trade size:", reply_markup=kb)
-
-@dp.message(F.text.in_(["🏷️ Set Topic"]))
-async def btn_set_topic(m: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🌍 All Topics", callback_data="topic_all")], [InlineKeyboardButton(text="📊 Macro", callback_data="topic_macro"), InlineKeyboardButton(text="₿ Crypto", callback_data="topic_crypto")], [InlineKeyboardButton(text="⚽ Sports", callback_data="topic_sports")]])
-    await m.answer("🏷️ <b>Select Topic Filter</b>\n\nChoose markets:", reply_markup=kb)
-
-@dp.message(F.text.in_(["🌍 Set Timezone"]))
-async def btn_set_timezone(m: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🇺🇸 US/Eastern", callback_data="tz_America/New_York"), InlineKeyboardButton(text="🇺🇸 US/Pacific", callback_data="tz_America/Los_Angeles")], [InlineKeyboardButton(text="🇬🇧 London", callback_data="tz_Europe/London"), InlineKeyboardButton(text="🇪🇺 Paris", callback_data="tz_Europe/Paris")], [InlineKeyboardButton(text="🇦🇪 Dubai", callback_data="tz_Asia/Dubai"), InlineKeyboardButton(text="🇯🇵 Tokyo", callback_data="tz_Asia/Tokyo")], [InlineKeyboardButton(text="🌐 UTC", callback_data="tz_UTC")]])
-    await m.answer("🌍 <b>Select Timezone</b>\n\nChoose your timezone:", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("thresh_"))
-async def handle_thresh_callback(callback: CallbackQuery):
-    val = int(callback.data.split("_")[1])
+@dp.message(F.text.in_(["📊 Recent"]))
+async def btn_recent(m: Message):
+    _, _, _, tz = await get_user_prefs(m.from_user.id)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO subs(user_id, alerts_on, thresh_usd, topic, tz) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET thresh_usd=?", (callback.from_user.id, 1, val, "all", "UTC", val))
-        await db.commit()
-    await callback.message.edit_text(f"✅ Alert threshold set to <b>${val:,.0f}</b>")
+        cur = await db.execute("SELECT ticker, side, notional_usd, ts_ms FROM prints ORDER BY id DESC LIMIT 10")
+        rows = await cur.fetchall()
+        await cur.close()
+
+    if not rows:
+        return await m.answer("No recent whale prints.", reply_markup=MAIN_KB)
+
+    lines = ["📊 <b>Recent Whale Prints</b>\n"]
+    for tk, side, notional, ts_ms in rows:
+        title, _ = await get_market_info(tk)
+        if not title:
+            title = tk
+        flag = "🟢" if side == "yes" else "🔴"
+        lines.append(f"{flag} <b>{html.escape(title)}</b>\n  💰 ${float(notional):,.0f} • {format_ts(ts_ms, tz)}\n  <a href='https://kalshi.com/?search={tk}'>{html.escape(tk)}</a>")
+
+    await m.answer("\n\n".join(lines), disable_web_page_preview=True)
+
+@dp.message(F.text.in_(["🏅 Leaderboard"]))
+async def btn_leaderboard(m: Message):
+    """Show leaderboard options"""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Markets Traded", callback_data="lb_markets"),
+         InlineKeyboardButton(text="💵 Volume", callback_data="lb_volume")],
+        [InlineKeyboardButton(text="📈 Last 7 Days", callback_data="lb_week")]
+    ])
+    await m.answer("🏆 <b>Leaderboard</b>\n\nSelect metric:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("lb_"))
+async def leaderboard_callback(callback: CallbackQuery):
+    metric_map = {
+        "lb_markets": ("num_markets_traded", "Markets Traded (All Time)"),
+        "lb_volume": ("volume", "Trading Volume (All Time)"),
+        "lb_week": ("num_markets_traded", "Markets Traded (Last 7 Days)")
+    }
+
+    metric, label = metric_map.get(callback.data, ("num_markets_traded", "Markets"))
+    since_day = 7 if "week" in callback.data else 0
+
+    try:
+        data = await KALSHI.get("/v1/social/leaderboard", params={
+            "metric_name": metric,
+            "limit": 10,
+            "since_day_before": since_day
+        })
+
+        rank_list = data.get("rank_list", [])
+        if not rank_list:
+            await callback.message.edit_text("No leaderboard data available.")
+            return
+
+        lines = [f"🏆 <b>{label}</b>\n"]
+        for i, trader in enumerate(rank_list, 1):
+            nickname = trader.get("nickname", "Unknown")
+            value = trader.get("value", 0)
+            rank = trader.get("rank", "?")
+    
+            if metric == "volume":
+                value_str = f"${value/1_000_000:.1f}M"
+            else:
+                value_str = f"{value:,}"
+    
+            lines.append(f"{i}. <b>{html.escape(nickname)}</b>\n   Rank: #{rank} | {value_str}")
+
+        await callback.message.edit_text("\n\n".join(lines))
+    except Exception as e:
+        log.error(f"Leaderboard error: {e}")
+        await callback.message.edit_text(f"⚠️ Error: {e}")
+
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("topic_"))
-async def handle_topic_callback(callback: CallbackQuery):
-    topic = callback.data.split("_")[1]
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO subs(user_id, alerts_on, thresh_usd, topic, tz) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET topic=?", (callback.from_user.id, 1, DEFAULT_THRESH, topic, "UTC", topic))
-        await db.commit()
-    names = {"all": "All Topics", "macro": "Macro", "crypto": "Crypto", "sports": "Sports"}
-    await callback.message.edit_text(f"✅ Topic filter set to <b>{names.get(topic, topic)}</b>")
+@dp.callback_query(F.data.startswith("whale_"))
+async def whale_callback(callback: CallbackQuery):
+    nickname = callback.data.replace("whale_", "", 1)
+
+    try:
+        # Get trader profile
+        profile = await KALSHI.get("/v1/social/profile", params={"nickname": nickname})
+
+        # Get recent trades
+        trades = await KALSHI.get("/v1/social/trades", params={
+            "nickname": nickname,
+            "page_size": 10
+        })
+
+        lines = [f"🐋 <b>{html.escape(nickname)}</b>\n"]
+        lines.append(f"Rank: #{profile.get('rank', '?')}")
+
+        trade_list = trades.get("trades", [])
+        if trade_list:
+            lines.append(f"\n📊 <b>Recent Trades ({len(trade_list)})</b>")
+            for trade in trade_list[:5]:
+                ticker = trade.get("ticker", "?")
+                price = trade.get("price_dollars", "?")
+                count = trade.get("count", 0)
+                side = "🟢 YES" if trade.get("taker_side") == "yes" else "🔴 NO"
+                lines.append(f"{side} {ticker} @ ${price} ({count} shares)")
+
+        await callback.message.edit_text("\n".join(lines))
+    except Exception as e:
+        log.error(f"Whale profile error: {e}")
+        await callback.message.edit_text(f"⚠️ Could not load whale profile: {e}")
+
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("tz_"))
-async def handle_tz_callback(callback: CallbackQuery):
-    tz = callback.data.split("_", 1)[1]
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO subs(user_id, alerts_on, thresh_usd, topic, tz) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET tz=?", (callback.from_user.id, 1, DEFAULT_THRESH, "all", tz, tz))
-        await db.commit()
-    await callback.message.edit_text(f"✅ Timezone set to <b>{tz}</b>")
-    await callback.answer()
-
-@dp.message(F.text.in_(["📞 Contact Me"]))
-async def btn_contact(m: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🐦 Follow on X", url="https://x.com/ArshiaXBT")]])
-    await m.answer("📞 <b>Contact Developer</b>\n\nConnect on X:", reply_markup=kb)
-
-@dp.message(F.text.in_(["🏠 Home"]))
-async def btn_home(m: Message):
-    await m.answer("🏠 <b>Main Menu</b>\n\nUse buttons:", reply_markup=MAIN_KB)
-@dp.message(Command("announce"))
-async def cmd_announce(m: Message):
-    """Broadcast announcement to all users"""
-    if m.from_user.id != 105356242:  # CHANGE THIS TO YOUR USER ID
+@dp.message(Command("msg"))
+async def cmd_msg(m: Message):
+    """Send custom message to all users: /msg Hello everyone!"""
+    if m.from_user.id != 105356242:  # Change to your ID
         await m.answer("❌ Not authorized")
         return
-    
-    announcement = """🚀 <b>MAJOR UPDATE</b>
 
-Valshi now uses <b>WebSocket</b> for real-time alerts!
+    # Get the message after /msg
+    text = m.text.replace("/msg ", "", 1)
+    if not text:
+        await m.answer("Usage: /msg <your message>")
+        return
 
-⚡ What changed:
-• Before: 10 second delay
-• Now: <b>Instant alerts</b> ⚡
-
-🔥 You'll see whale trades immediately!
-
-Keep hunting! 🐋"""
-    
+    # Send to all users
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id FROM subs")
+        cur = await db.execute("SELECT DISTINCT user_id FROM subs")
         users = await cur.fetchall()
         await cur.close()
-    
+
     count = 0
     for (user_id,) in users:
         try:
-            await bot.send_message(user_id, announcement)
+            await bot.send_message(user_id, text)
             count += 1
-        except:
-            pass
-    
-    await m.answer(f"✅ Announcement sent to {count} users!")
+        except Exception as e:
+            log.warning(f"Failed to send to {user_id}: {e}")
+
+    await m.answer(f"✅ Sent to {count} users")
+
+@dp.message(Command("announce"))
+async def cmd_announce(m: Message):
+    """Broadcast announcement to all users"""
+    if m.from_user.id != 105356242: # CHANGE THIS TO YOUR USER ID
+        await m.answer("❌ Not authorized")
+        return
+
+    announcement = """🚀 <b>MAJOR UPDATE</b>
+
+✨ <b>New Features Added:</b>
+✅ Leaderboard tracking (/leaderboard)
+✅ Whale trader profiles (/whale)
+✅ Better search & discovery
+
+Use /leaderboard to see top traders!"""
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT DISTINCT user_id FROM subs")
+        users = await cur.fetchall()
+        await cur.close()
+
+    for (user_id,) in users:
+        try:
+            await bot.send_message(user_id, announcement)
+        except Exception as e:
+            log.warning(f"Failed to send to {user_id}: {e}")
+
+    await m.answer(f"✅ Announcement sent to {len(users)} users")
 
 async def main():
+    log.info("Valshi starting with WebSocket...")
     await db_init()
     asyncio.create_task(websocket_loop())
-    log.info("Valshi starting with WebSocket...")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await KALSHI.client.aclose()
-        await bot.session.close()
-        log.info("Shutdown complete.")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
