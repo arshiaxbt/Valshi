@@ -30,9 +30,8 @@ dp = Dispatcher()
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🔔 Alerts On"), KeyboardButton(text="🔕 Alerts Off")],
     [KeyboardButton(text="📊 Recent"), KeyboardButton(text="🏆 Top 24h")],
-    [KeyboardButton(text="📣 Recent RFQ"), KeyboardButton(text="🏅 Leaderboard")],
-    [KeyboardButton(text="🔍 Search Markets"), KeyboardButton(text="⚙️ Settings")],
-    [KeyboardButton(text="📞 Contact Me")]], resize_keyboard=True)
+    [KeyboardButton(text="🔍 Search Markets"), KeyboardButton(text="🏅 Leaderboard")],
+    [KeyboardButton(text="⚙️ Settings"), KeyboardButton(text="📞 Contact Me")]], resize_keyboard=True)
 
 SETTINGS_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="💰 Set Threshold"), KeyboardButton(text="🏷️ Set Topic")],
