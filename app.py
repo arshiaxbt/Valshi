@@ -1,5 +1,6 @@
 """Valshi - Kalshi whale tracker with WebSocket + Leaderboard"""
 
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardRemove
 import os, logging, asyncio, aiosqlite, html, json, time, base64
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -28,9 +29,10 @@ dp = Dispatcher()
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🔔 Alerts On"), KeyboardButton(text="🔕 Alerts Off")],
-              [KeyboardButton(text="📊 Recent"), KeyboardButton(text="🏆 Top 24h")],
-              [KeyboardButton(text="🏅 Leaderboard"), KeyboardButton(text="⚙️ Settings")],
-              [KeyboardButton(text="📞 Contact Me")]], resize_keyboard=True)
+    [KeyboardButton(text="📊 Recent"), KeyboardButton(text="🏆 Top 24h")],
+    [KeyboardButton(text="📣 Recent RFQ"), KeyboardButton(text="🏅 Leaderboard")],
+    [KeyboardButton(text="🔍 Search Markets"), KeyboardButton(text="⚙️ Settings")],
+    [KeyboardButton(text="📞 Contact Me")]], resize_keyboard=True)
 
 SETTINGS_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="💰 Set Threshold"), KeyboardButton(text="🏷️ Set Topic")],
@@ -490,6 +492,126 @@ Use /leaderboard to see top traders!"""
             log.warning(f"Failed to send to {user_id}: {e}")
 
     await m.answer(f"✅ Announcement sent to {len(users)} users")
+
+# Store search context per user
+user_search_context = {}
+
+@dp.message(F.text.in_(["🔍 Search Markets"]))
+async def btn_search_markets(m: Message):
+    """Open search markets interface - step 1"""
+    await m.answer("🔍 Search Markets\n\nType a keyword to search (e.g., trump, bitcoin, elections):", reply_markup=ReplyKeyboardRemove())
+
+@dp.message(F.text)
+async def handle_search_input(m: Message):
+    """Handle search input"""
+    text = m.text.strip()
+    
+    if text.startswith("/") or text in ["🔔 Alerts On", "🔕 Alerts Off", "📊 Recent", "🏆 Top 24h", "📣 Recent RFQ", "🏅 Leaderboard", "🔍 Search Markets", "⚙️ Settings", "📞 Contact Me", "🏠 Home", "💰 Set Threshold", "🏷️ Set Topic", "🌍 Set Timezone", "📈 My Stats"]:
+        return
+    
+    if len(text) < 2:
+        return
+    
+    try:
+        data = await KALSHI.get("/v1/search/series", params={
+            "query": text,
+            "embedding_search": "true",
+            "order_by": "querymatch",
+            "limit": 20
+        })
+        
+        series_list = data.get("current_page", [])
+        if not series_list:
+            await m.answer(f"❌ No markets found for: {html.escape(text)}", reply_markup=MAIN_KB)
+            return
+        
+        user_search_context[m.from_user.id] = {
+            "query": text,
+            "results": series_list
+        }
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Last 6h", callback_data="search_tf_6h"),
+            InlineKeyboardButton(text="Last 24h", callback_data="search_tf_24h")],
+            [InlineKeyboardButton(text="Last 7d", callback_data="search_tf_7d"),
+            InlineKeyboardButton(text="All Time", callback_data="search_tf_all")]
+        ])
+        await m.answer(f"📊 Found {len(series_list)} markets for: {html.escape(text)}\n\n<b>Step 1:</b> Choose timeframe", reply_markup=kb)
+    except Exception as e:
+        log.error(f"Search error: {e}")
+        await m.answer(f"⚠️ Search failed", reply_markup=MAIN_KB)
+
+@dp.callback_query(F.data.startswith("search_tf_"))
+async def search_timeframe_callback(callback: CallbackQuery):
+    """Step 2: Choose timeframe"""
+    tf = callback.data.split("_")[2]
+    user_search_context[callback.from_user.id]["timeframe"] = tf
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📈 High Volume", callback_data="search_sort_volume"),
+        InlineKeyboardButton(text="⏱️ Most Recent", callback_data="search_sort_recent")]
+    ])
+    await callback.message.edit_text("<b>Step 2:</b> Sort by", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("search_sort_"))
+async def search_sort_callback(callback: CallbackQuery):
+    """Step 3: Choose sort order"""
+    sort = callback.data.split("_")[2]
+    user_search_context[callback.from_user.id]["sort"] = sort
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Top 3", callback_data="search_limit_3"),
+        InlineKeyboardButton(text="Top 5", callback_data="search_limit_5")],
+        [InlineKeyboardButton(text="Top 10", callback_data="search_limit_10"),
+        InlineKeyboardButton(text="Top 15", callback_data="search_limit_15")]
+    ])
+    await callback.message.edit_text("<b>Step 3:</b> How many results?", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("search_limit_"))
+async def search_limit_callback(callback: CallbackQuery):
+    """Step 4: Display results"""
+    limit = int(callback.data.split("_")[2])
+    ctx = user_search_context.get(callback.from_user.id, {})
+    results = ctx.get("results", [])
+    sort = ctx.get("sort", "volume")
+    
+    if sort == "volume":
+        results = sorted(results, key=lambda x: x.get("total_series_volume", 0), reverse=True)
+    else:
+        results = sorted(results, key=lambda x: x.get("open_ts", ""), reverse=True)
+    
+    results = results[:limit]
+    
+    msg_parts = []
+    for i, s in enumerate(results, 1):
+        title = s.get("series_title", "?")
+        ticker = s.get("series_ticker", "?")
+        volume = s.get("total_series_volume", 0)
+        markets_count = len(s.get("markets", []))
+        market_url = f"https://kalshi.com/?search={ticker}"
+        part = f"{i}. <a href='{market_url}'>{html.escape(title[:40])}</a>\n💰 ${volume:,} • {markets_count} mkts"
+        msg_parts.append(part)
+    
+    final_msg = "🔍 <b>Search Results</b>\n\n" + "\n\n".join(msg_parts)
+    
+    if len(final_msg) > 4000:
+        final_msg = final_msg[:4000] + "\n\n...(truncated)"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Home", callback_data="home_main")]])
+
+    await callback.message.edit_text(final_msg)
+    await callback.message.answer("✅ Done", reply_markup=MAIN_KB)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "home_main")
+async def home_callback(callback: CallbackQuery):
+    """Return to main menu"""
+    await callback.message.delete()
+    await callback.message.answer("🏠 Home", reply_markup=MAIN_KB)
+    await callback.answer()
 
 async def main():
     log.info("Valshi starting with WebSocket...")
